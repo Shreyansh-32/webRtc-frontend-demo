@@ -1,241 +1,204 @@
-import { useEffect, useRef, useState } from "react";
-import { useSocket } from "./socket/useSocket";
+import React, { useState, useRef, useEffect } from 'react';
 
-type SignalMessage =
-  | { type: "offer"; sdp: string; from: string }
-  | { type: "answer"; sdp: string; from: string }
-  | { type: "candidate"; candidate: RTCIceCandidateInit; from: string };
+// Define the structure of messages for signaling with specific payload types
+type OfferMessage = { type: 'offer'; payload: RTCSessionDescriptionInit };
+type AnswerMessage = { type: 'answer'; payload: RTCSessionDescriptionInit };
+type CandidateMessage = { type: 'candidate'; payload: RTCIceCandidateInit };
+type SignalingMessage = OfferMessage | AnswerMessage | CandidateMessage;
 
-function App() {
-  const socket = useSocket();
+const App: React.FC = () => {
+  // Refs for video elements and the peer connection
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const webSocketRef = useRef<WebSocket | null>(null);
 
-  // Stable peer ID for tie-breaking
-  const myIdRef = useRef<string>(
-    typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : Math.random().toString(36).slice(2)
-  );
-  const remoteIdRef = useRef<string | null>(null);
-  const isPoliteRef = useRef<boolean | null>(null);
-
-  const pcRef = useRef<RTCPeerConnection>(
-    new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-      ],
-    })
-  );
-
-  // Perfect Negotiation state
-  const makingOfferRef = useRef(false);
-  const ignoreOfferRef = useRef(false);
-
-  const localVideoRef = useRef<HTMLVideoElement | null>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  // State to manage UI elements
   const [isCallActive, setIsCallActive] = useState(false);
-  const [isSetup, setIsSetup] = useState(false);
-  const iceQueueRef = useRef<RTCIceCandidateInit[]>([]);
 
-  // ===== PC event handlers =====
+  // Google's public STUN servers
+  const stunServers: RTCConfiguration = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ],
+  };
+
+  // Effect to initialize WebSocket connection
   useEffect(() => {
-    const pc = pcRef.current;
-    if (!pc) return;
+    // Connect to the signaling server
+    // Replace 'ws://localhost:8080' with your server's address
+    const ws = new WebSocket('ws://localhost:8080');
+    webSocketRef.current = ws;
 
-    pc.onnegotiationneeded = async () => {
-      try {
-        makingOfferRef.current = true;
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket?.send(
-          JSON.stringify({
-            type: "offer",
-            sdp: offer.sdp!,
-            from: myIdRef.current,
-          } satisfies SignalMessage)
-        );
-      } catch (e) {
-        console.error("onnegotiationneeded error:", e);
-      } finally {
-        makingOfferRef.current = false;
+    ws.onopen = () => {
+      console.log('WebSocket connection established.');
+    };
+
+    ws.onmessage = async (message: MessageEvent) => {
+      // Parse the incoming message data
+      const raw = message.data as string;
+      const data = JSON.parse(raw) as SignalingMessage;
+      console.log('Received signaling message:', data);
+
+      // Ensure peer connection is initialized, especially for the callee
+      if (!peerConnectionRef.current && data.type !== 'offer') {
+        console.log('Received signal before peer connection was created. Ignoring.');
+        return;
+      }
+
+      if (!peerConnectionRef.current && data.type === 'offer') {
+        await createPeerConnection();
+      }
+
+      const pc = peerConnectionRef.current!;
+
+      switch (data.type) {
+        case 'offer':
+          // Received an offer from the other peer
+          await pc.setRemoteDescription(data.payload as RTCSessionDescriptionInit);
+          {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendMessage({ type: 'answer', payload: answer });
+          }
+          break;
+        case 'answer':
+          // Received an answer from the other peer
+          await pc.setRemoteDescription(data.payload as RTCSessionDescriptionInit);
+          break;
+        case 'candidate':
+          // Received an ICE candidate from the other peer
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(data.payload as RTCIceCandidateInit));
+          } catch (e) {
+            console.error('Error adding received ice candidate', e);
+          }
+          break;
+        default:
+          // This case handles any message types that are not 'offer', 'answer', or 'candidate'
+          console.warn('Unknown message type received:', data);
       }
     };
 
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        socket?.send(
-          JSON.stringify({
-            type: "candidate",
-            candidate: ev.candidate.toJSON(),
-            from: myIdRef.current,
-          } satisfies SignalMessage)
-        );
-      }
+    ws.onclose = () => {
+      console.log('WebSocket connection closed.');
     };
 
-    pc.ontrack = (ev) => {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = ev.streams[0];
-        setIsCallActive(true);
-      }
-    };
-  }, [socket]);
-
-  // ===== Socket message handling =====
-  useEffect(() => {
-    if (!socket) return;
-
-    socket.onmessage = async (event: MessageEvent<string>) => {
-      const msg: SignalMessage = JSON.parse(event.data);
-
-      // Ignore our own relayed messages
-      if (msg.from === myIdRef.current) return;
-
-      // Capture/compute remote id & role
-      if (!remoteIdRef.current) {
-        remoteIdRef.current = msg.from;
-        isPoliteRef.current = myIdRef.current > remoteIdRef.current;
-      }
-
-      const pc = pcRef.current;
-
-      try {
-        if (msg.type === "offer") {
-          const offer = new RTCSessionDescription({
-            type: "offer",
-            sdp: msg.sdp,
-          });
-
-          const offerCollision =
-            makingOfferRef.current || pc.signalingState !== "stable";
-
-          ignoreOfferRef.current =
-            !isPoliteRef.current && offerCollision;
-
-          if (ignoreOfferRef.current) {
-            console.log(
-              "[PerfectNeg] Ignoring received offer (impolite & collision)"
-            );
-            return;
-          }
-
-          if (offerCollision) {
-            console.log(
-              "[PerfectNeg] Collision → rollback then apply remote offer"
-            );
-            await pc.setLocalDescription({ type: "rollback" } );
-          }
-
-          await pc.setRemoteDescription(offer);
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          socket.send(
-            JSON.stringify({
-              type: "answer",
-              sdp: answer.sdp!,
-              from: myIdRef.current,
-            } satisfies SignalMessage)
-          );
-
-          // Flush ICE
-          while (iceQueueRef.current.length) {
-            const c = iceQueueRef.current.shift()!;
-            await pc.addIceCandidate(new RTCIceCandidate(c));
-          }
-        }
-
-        if (msg.type === "answer") {
-          await pc.setRemoteDescription(
-            new RTCSessionDescription({ type: "answer", sdp: msg.sdp })
-          );
-          while (iceQueueRef.current.length) {
-            const c = iceQueueRef.current.shift()!;
-            await pc.addIceCandidate(new RTCIceCandidate(c));
-          }
-        }
-
-        if (msg.type === "candidate") {
-          if (pc.remoteDescription) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-            } catch (err) {
-              if (!ignoreOfferRef.current) {
-                console.error("Error adding ICE candidate:", err);
-              }
-            }
-          } else {
-            iceQueueRef.current.push(msg.candidate);
-          }
-        }
-      } catch (err) {
-        console.error("Signaling error:", err);
-      }
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
     };
 
+    // Cleanup on component unmount
     return () => {
-      socket.onmessage = null;
+      ws.close();
+      peerConnectionRef.current?.close();
     };
-  }, [socket]);
+  }, []);
 
-  // ===== Start camera / add tracks (this triggers negotiationneeded) =====
-  const handleStart = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
-      stream.getTracks().forEach((t) => pcRef.current.addTrack(t, stream));
-      setIsSetup(true);
-    } catch (e) {
-      console.error("getUserMedia failed:", e);
-      alert("Could not access camera/mic. Check permissions.");
+  // Function to send messages through the WebSocket
+  const sendMessage = (message: SignalingMessage) => {
+    if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+      webSocketRef.current.send(JSON.stringify(message));
+    } else {
+      console.error('WebSocket is not open. Cannot send message.');
     }
   };
 
+  // Function to create and configure the RTCPeerConnection
+  const createPeerConnection = async () => {
+    if (peerConnectionRef.current) return;
+
+    const pc = new RTCPeerConnection(stunServers);
+    peerConnectionRef.current = pc;
+
+    // Event handler for when a new ICE candidate is created
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        // event.candidate.toJSON() is RTCIceCandidateInit
+        sendMessage({ type: 'candidate', payload: event.candidate.toJSON() as RTCIceCandidateInit });
+      }
+    };
+
+    // Event handler for when the remote stream is added
+    pc.ontrack = (event) => {
+      if (remoteVideoRef.current && event.streams[0]) {
+        remoteVideoRef.current.srcObject = event.streams[0];
+      }
+    };
+
+    // Get local media stream and add it to the peer connection
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    } catch (error) {
+      console.error('Error accessing media devices.', error);
+    }
+  };
+
+  // Function to start the call (caller side)
+  const startCall = async () => {
+    setIsCallActive(true);
+    await createPeerConnection();
+    const pc = peerConnectionRef.current!;
+
+    // Create an offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Send the offer to the other peer via the signaling server
+    sendMessage({ type: 'offer', payload: offer });
+  };
+
+  // Function to hang up the call
+  const hangUp = () => {
+    peerConnectionRef.current?.close();
+    peerConnectionRef.current = null;
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
+    }
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+    setIsCallActive(false);
+    console.log('Call ended.');
+  };
+
   return (
-    <div className="w-full min-h-screen bg-gray-900 text-white flex flex-col items-center gap-6 p-4">
-      <h2 className="text-4xl">WebRTC Demo</h2>
-      <div className="flex gap-4 h-12 items-center">
-        {!isSetup && (
-          <button
-            onClick={handleStart}
-            className="bg-green-600 p-3 rounded-lg text-xl"
-          >
-            Start Camera and Join
-          </button>
-        )}
-        {isSetup && <p className="text-lg text-green-400">Ready</p>}
-      </div>
-
-      <div className="flex flex-wrap justify-center gap-4 w-full">
-        <div className="flex flex-col items-center">
-          <h3 className="text-xl mb-2">Your Video</h3>
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            className="w-full max-w-lg border-2 rounded-lg"
-            muted
-          />
+    <div className="bg-gray-900 text-white min-h-screen flex flex-col items-center justify-center font-sans p-4">
+      <h1 className="text-4xl font-bold mb-6">WebRTC Video Call</h1>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-5xl">
+        <div className="bg-gray-800 rounded-lg p-4 shadow-lg">
+          <h2 className="text-2xl mb-2 text-center">Local Video</h2>
+          <video ref={localVideoRef} autoPlay playsInline muted className="w-full rounded-md" />
         </div>
-
-        {isCallActive && (
-          <div className="flex flex-col items-center">
-            <h3 className="text-xl mb-2">Remote Video</h3>
-            <video
-              ref={remoteVideoRef}
-              autoPlay
-              playsInline
-              className="w-full max-w-lg border-2 rounded-lg"
-            />
-          </div>
+        <div className="bg-gray-800 rounded-lg p-4 shadow-lg">
+          <h2 className="text-2xl mb-2 text-center">Remote Video</h2>
+          <video ref={remoteVideoRef} autoPlay playsInline className="w-full rounded-md" />
+        </div>
+      </div>
+      <div className="mt-8 flex space-x-4">
+        {!isCallActive ? (
+          <button
+            onClick={startCall}
+            className="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300"
+          >
+            Start Call
+          </button>
+        ) : (
+          <button
+            onClick={hangUp}
+            className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300"
+          >
+            Hang Up
+          </button>
         )}
       </div>
     </div>
   );
-}
+};
 
 export default App;
