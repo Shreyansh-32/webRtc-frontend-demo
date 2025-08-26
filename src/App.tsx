@@ -28,7 +28,7 @@ const App: React.FC = () => {
   useEffect(() => {
     // Connect to the signaling server
     // Replace 'ws://localhost:8080' with your server's address
-    const ws = new WebSocket('ws://localhost:8080');
+    const ws = new WebSocket('https://webrtc-backend-demo-4.onrender.com');
     webSocketRef.current = ws;
 
     ws.onopen = () => {
