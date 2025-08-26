@@ -25,7 +25,8 @@ async function createAnswer(socket: WebSocket, peerConnection: RTCPeerConnection
       type: "answer",
       sdp: answer.sdp
     }));
-  } catch (error) {
+  } catch (error)
+  {
     console.error("Failed to create answer:", error);
   }
 }
@@ -43,8 +44,6 @@ function App() {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const [isCallActive, setIsCallActive] = useState(false);
   const [isSetup, setIsSetup] = useState(false);
-
-  // FIX: Create a ref to hold an array for queued ICE candidates.
   const iceCandidateQueue = useRef<RTCIceCandidateInit[]>([]);
 
   useEffect(() => {
@@ -71,24 +70,27 @@ function App() {
       const message = JSON.parse(event.data);
       console.log("Received message: ", message.type);
 
-      if (message.type === "offer") {
+      // FIX: New message type from server to start the call automatically.
+      if (message.type === 'initiate-call') {
+          console.log("Server instructed to initiate call.");
+          createOffer(socket, peerConnection.current);
+      } else if (message.type === "offer") {
         await createAnswer(socket, peerConnection.current, message.sdp);
         
-        // FIX: After setting remote description in createAnswer, process any queued candidates.
+        // Process any queued candidates after handling the offer.
         iceCandidateQueue.current.forEach(candidate => {
             peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
         });
-        iceCandidateQueue.current = []; // Clear the queue
+        iceCandidateQueue.current = [];
       } else if (message.type === "answer") {
         await peerConnection.current.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: message.sdp }));
         
-        // FIX: After setting remote description, process any queued candidates.
+        // Process any queued candidates after handling the answer.
         iceCandidateQueue.current.forEach(candidate => {
             peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
         });
-        iceCandidateQueue.current = []; // Clear the queue
+        iceCandidateQueue.current = [];
       } else if (message.type === "candidate") {
-        // FIX: Check if the remote description is set. If not, queue the candidate.
         if (peerConnection.current.remoteDescription) {
             try {
                 await peerConnection.current.addIceCandidate(new RTCIceCandidate(message.candidate));
@@ -96,7 +98,7 @@ function App() {
                 console.error("Error adding received ice candidate", error);
             }
         } else {
-            console.log("Remote description not set. Queuing ICE candidate.");
+            // If remote description isn't set, queue the candidate.
             iceCandidateQueue.current.push(message.candidate);
         }
       }
@@ -114,28 +116,25 @@ function App() {
         peerConnection.current.addTrack(track, stream);
       });
       setIsSetup(true);
+      
+      // FIX: Once setup is complete, tell the server we are ready.
       if (socket) {
-        // NOTE: The server logic you have is fine, but this client-side fix is the key.
-        // For simplicity, I'm keeping the manual "Call" button logic here.
+        socket.send(JSON.stringify({ type: 'ready' }));
       }
     } catch (error) {
       console.error("Error accessing media devices.", error);
+      alert("Could not access camera and microphone. Please check permissions.");
     }
   };
   
-  const handleCall = () => {
-    if (socket) {
-      console.log("Creating offer...");
-      createOffer(socket, peerConnection.current);
-    }
-  };
-
   return (
     <div className="w-full min-h-screen bg-gray-900 text-white flex flex-col items-center gap-6 p-4">
       <h2 className="text-4xl">WebRTC Demo</h2>
-      <div className="flex gap-4">
-        {!isSetup && <button onClick={handleStart} className="bg-green-600 p-3 rounded-lg text-xl">Start Camera</button>}
-        {isSetup && <button onClick={handleCall} className="bg-blue-600 p-3 rounded-lg text-xl">Call</button>}
+      <div className="flex gap-4 h-12 items-center">
+        {/* FIX: The UI now only has one button to start and join. */}
+        {!isSetup && <button onClick={handleStart} className="bg-green-600 p-3 rounded-lg text-xl">Start Camera and Join</button>}
+        {/* FIX: A waiting message is shown after joining. */}
+        {isSetup && <p className="text-lg text-green-400">Waiting for another user to join...</p>}
       </div>
       <div className="flex flex-wrap justify-center gap-4 w-full">
         <div className="flex flex-col items-center">
