@@ -46,6 +46,63 @@ function App() {
   const [isSetup, setIsSetup] = useState(false);
   const iceCandidateQueue = useRef<RTCIceCandidateInit[]>([]);
 
+  // FIX: Use a ref to track the setup state to avoid stale closures in the onmessage handler.
+  const setupRef = useRef(isSetup);
+  useEffect(() => {
+    setupRef.current = isSetup;
+  }, [isSetup]);
+
+  // FIX: This useEffect now ONLY handles setting up the WebSocket message listener.
+  // It runs as soon as the socket is available, ensuring no messages are missed.
+  useEffect(() => {
+    if (!socket) return;
+
+    socket.onmessage = async (event) => {
+      // Use the ref to check if the app is ready to process signaling messages.
+      if (!setupRef.current) {
+        return; 
+      }
+
+      const message = JSON.parse(event.data);
+      console.log("Received message: ", message.type);
+      
+      if (message.type === 'initiate-call') {
+          console.log("Server instructed to initiate call.");
+          createOffer(socket, peerConnection.current);
+      } else if (message.type === "offer") {
+        await createAnswer(socket, peerConnection.current, message.sdp);
+        
+        iceCandidateQueue.current.forEach(candidate => {
+            peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        });
+        iceCandidateQueue.current = [];
+      } else if (message.type === "answer") {
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: message.sdp }));
+        
+        iceCandidateQueue.current.forEach(candidate => {
+            peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        });
+        iceCandidateQueue.current = [];
+      } else if (message.type === "candidate") {
+        if (peerConnection.current.remoteDescription) {
+            try {
+                await peerConnection.current.addIceCandidate(new RTCIceCandidate(message.candidate));
+            } catch (error) {
+                console.error("Error adding received ice candidate", error);
+            }
+        } else {
+            iceCandidateQueue.current.push(message.candidate);
+        }
+      }
+    };
+
+    return () => {
+      socket.onmessage = null;
+    }
+  }, [socket]);
+
+  // FIX: This new useEffect handles setting up the RTCPeerConnection event listeners.
+  // It runs only after the user has clicked "Start" and the setup is complete.
   useEffect(() => {
     if (!socket || !isSetup) return;
 
@@ -65,45 +122,6 @@ function App() {
         setIsCallActive(true);
       }
     };
-
-    socket.onmessage = async (event) => {
-      const message = JSON.parse(event.data);
-      console.log("Received message: ", message.type);
-
-      // FIX: New message type from server to start the call automatically.
-      if (message.type === 'initiate-call') {
-          console.log("Server instructed to initiate call.");
-          createOffer(socket, peerConnection.current);
-      } else if (message.type === "offer") {
-        await createAnswer(socket, peerConnection.current, message.sdp);
-        
-        // Process any queued candidates after handling the offer.
-        iceCandidateQueue.current.forEach(candidate => {
-            peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
-        });
-        iceCandidateQueue.current = [];
-      } else if (message.type === "answer") {
-        await peerConnection.current.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: message.sdp }));
-        
-        // Process any queued candidates after handling the answer.
-        iceCandidateQueue.current.forEach(candidate => {
-            peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
-        });
-        iceCandidateQueue.current = [];
-      } else if (message.type === "candidate") {
-        if (peerConnection.current.remoteDescription) {
-            try {
-                await peerConnection.current.addIceCandidate(new RTCIceCandidate(message.candidate));
-            } catch (error) {
-                console.error("Error adding received ice candidate", error);
-            }
-        } else {
-            // If remote description isn't set, queue the candidate.
-            iceCandidateQueue.current.push(message.candidate);
-        }
-      }
-    };
-
   }, [socket, isSetup]);
 
   const handleStart = async () => {
@@ -115,10 +133,12 @@ function App() {
       stream.getTracks().forEach((track) => {
         peerConnection.current.addTrack(track, stream);
       });
+      
+      // This state update will trigger the second useEffect to run.
       setIsSetup(true);
       
-      // FIX: Once setup is complete, tell the server we are ready.
       if (socket) {
+        // The onmessage handler is already listening, so it's safe to send this now.
         socket.send(JSON.stringify({ type: 'ready' }));
       }
     } catch (error) {
@@ -131,9 +151,7 @@ function App() {
     <div className="w-full min-h-screen bg-gray-900 text-white flex flex-col items-center gap-6 p-4">
       <h2 className="text-4xl">WebRTC Demo</h2>
       <div className="flex gap-4 h-12 items-center">
-        {/* FIX: The UI now only has one button to start and join. */}
         {!isSetup && <button onClick={handleStart} className="bg-green-600 p-3 rounded-lg text-xl">Start Camera and Join</button>}
-        {/* FIX: A waiting message is shown after joining. */}
         {isSetup && <p className="text-lg text-green-400">Waiting for another user to join...</p>}
       </div>
       <div className="flex flex-wrap justify-center gap-4 w-full">
