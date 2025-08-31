@@ -94,7 +94,7 @@ export default function Home() {
             setLocalStream(stream);
             setInCall(true);
 
-            ws.current = new WebSocket('ws://localhost:8080');
+            ws.current = new WebSocket('https://webrtc-backend-demo.onrender.com');
 
             ws.current.onopen = () => {
                 console.log("Connected to signaling server");
